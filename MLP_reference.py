@@ -132,15 +132,13 @@ def print_c_array(name, arr, ctype="float"):
     flat = arr.reshape(-1)
     print(f"// {name} shape: {list(arr.shape)}")
     print(f"const {ctype} {name}[{flat.size}] = {{")
-    # pretty formatting: 8 numbers per line
     line = []
     for i, v in enumerate(flat):
-        if ctype in ("float", "double"):
-            s = f"{float(v):.7g}"
-            if ctype == "float":
-                s += "f"
-        else:  # integer types
-            s = str(int(v))
+        s = f"{float(v):.7g}"
+        if "." not in s:
+            s += ".0"
+        if ctype == "float":
+            s += "f"
         line.append(s)
         if (i+1) % 8 == 0:
             print("  " + ", ".join(line) + ",")
@@ -148,6 +146,7 @@ def print_c_array(name, arr, ctype="float"):
     if line:
         print("  " + ", ".join(line) + ",")
     print("};\n")
+
 
 # -----------------------------
 # 1) Print FLOAT32 weights/biases (direct use if FPGA supports float)
@@ -236,4 +235,36 @@ y_pred_q = quantized_inference(X_test, W1_q, b1_q, sW1, W2_q, b2_q, sW2)
 acc_q = accuracy_score(y_test, y_pred_q)
 
 print(f"Quantized Test Accuracy: {acc_q*100:.2f}%")
+
+with open("weights.h", "w") as f:
+    def write_arr(name, arr):
+        flat = arr.reshape(-1)
+        f.write(f"// {name} {list(arr.shape)}\n")
+        f.write(f"static const float {name}[{flat.size}] = {{\n")
+        for i, v in enumerate(flat):
+            f.write(f"  {float(v):.7g}f,")
+            if (i+1) % 8 == 0:
+                f.write("\n")
+        f.write("};\n\n")
+
+    write_arr("W1", lin1.W)           # shape (64, 8)
+    write_arr("b1", lin1.b.squeeze()) # shape (8,)
+    write_arr("W2", lin2.W)           # shape (8, 10)
+    write_arr("b2", lin2.b.squeeze()) # shape (10,)
+
+# Pick a test sample
+sample = X_test[0:1]  # shape (1, 64)
+
+print("\n// ===== Input sample exported for CUDA =====")
+print_c_array("X_sample", sample.squeeze(), "float")
+
+ref_hidden = np.maximum(sample @ lin1.W + lin1.b, 0)
+ref_logits = ref_hidden @ lin2.W + lin2.b
+
+print("\nPython Hidden:", ref_hidden)
+print("Python Logits:", ref_logits)
+print("Python Argmax:", np.argmax(ref_logits))
+
+
+
 
