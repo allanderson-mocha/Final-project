@@ -1,15 +1,15 @@
 #include <cstdio>
 #include <cstring>
+#include <cmath>
 #include <cuda_runtime.h>
 
-#include "weights.h"  // W1[64*8], b1[8], W2[8*10], b2[10]
-#include "inputs.h"   // X_sample[64]  (for now: single sample)
+#include "inputs.h"   // X_sample[64], PYTHON_LABEL
 
 // Problem sizes
 #define INPUT_DIM   64
 #define HIDDEN_DIM  8
 #define OUTPUT_DIM  10
-#define BATCH       1   // can increase later (M dimension)
+#define BATCH       1   // single input
 
 // Tiling parameters
 #define TILE_M 16
@@ -17,66 +17,49 @@
 #define TILE_K 16
 
 // ============================
-// Tiled shared-memory GEMM
-// C[M x N] = A[M x K] * B[K x N]
-// Row-major: A[m*K + k], B[k*N + n], C[m*N + n]
+// GEMM kernel
 // ============================
 __global__ void gemm_tiled_kernel(
-    const float* __restrict__ A,  // [M, K]
-    const float* __restrict__ B,  // [K, N]
-    float* __restrict__ C,        // [M, N]
+    const float* __restrict__ A,
+    const float* __restrict__ B,
+    float* __restrict__ C,
     int M, int N, int K)
 {
     __shared__ float As[TILE_M][TILE_K];
     __shared__ float Bs[TILE_K][TILE_N];
 
-    int row = blockIdx.y * TILE_M + threadIdx.y; // m
-    int col = blockIdx.x * TILE_N + threadIdx.x; // n
+    int row = blockIdx.y * TILE_M + threadIdx.y;
+    int col = blockIdx.x * TILE_N + threadIdx.x;
 
     float acc = 0.0f;
 
-    // Loop over tiles of K dimension
     int numTiles = (K + TILE_K - 1) / TILE_K;
     for (int t = 0; t < numTiles; ++t) {
-        int tiled_k_A = t * TILE_K + threadIdx.x; // column index for A tile
-        int tiled_k_B = t * TILE_K + threadIdx.y; // row index for B tile
+        int tiled_k_A = t * TILE_K + threadIdx.x;
+        int tiled_k_B = t * TILE_K + threadIdx.y;
 
-        // Load tile of A into shared mem
-        if (row < M && tiled_k_A < K) {
-            As[threadIdx.y][threadIdx.x] = A[row * K + tiled_k_A];
-        } else {
-            As[threadIdx.y][threadIdx.x] = 0.0f;
-        }
+        As[threadIdx.y][threadIdx.x] =
+            (row < M && tiled_k_A < K) ? A[row*K + tiled_k_A] : 0.0f;
 
-        // Load tile of B into shared mem
-        if (tiled_k_B < K && col < N) {
-            Bs[threadIdx.y][threadIdx.x] = B[tiled_k_B * N + col];
-        } else {
-            Bs[threadIdx.y][threadIdx.x] = 0.0f;
-        }
+        Bs[threadIdx.y][threadIdx.x] =
+            (tiled_k_B < K && col < N) ? B[tiled_k_B*N + col] : 0.0f;
 
         __syncthreads();
 
-        // Compute partial dot product for this tile
-        for (int k = 0; k < TILE_K; ++k) {
+        for (int k = 0; k < TILE_K; ++k)
             acc += As[threadIdx.y][k] * Bs[k][threadIdx.x];
-        }
 
         __syncthreads();
     }
 
-    // Write result
-    if (row < M && col < N) {
-        C[row * N + col] = acc;
-    }
+    if (row < M && col < N)
+        C[row*N + col] = acc;
 }
 
 // ============================
-// Bias + ReLU (for hidden layer)
-// ============================
 __global__ void add_bias_relu(
-    float* __restrict__ H,        // [M, N]
-    const float* __restrict__ b,  // [N]
+    float* __restrict__ H,
+    const float* __restrict__ b,
     int M, int N)
 {
     int row = blockIdx.y * blockDim.y + threadIdx.y;
@@ -88,159 +71,202 @@ __global__ void add_bias_relu(
     H[idx] = v > 0.0f ? v : 0.0f;
 }
 
-// ============================
-// Bias only (for output layer)
-// ============================
 __global__ void add_bias(
-    float* __restrict__ C,        // [M, N]
-    const float* __restrict__ b,  // [N]
+    float* __restrict__ C,
+    const float* __restrict__ b,
     int M, int N)
 {
     int row = blockIdx.y * blockDim.y + threadIdx.y;
     int col = blockIdx.x * blockDim.x + threadIdx.x;
     if (row >= M || col >= N) return;
 
-    int idx = row * N + col;
-    C[idx] += b[col];
+    C[row*N + col] += b[col];
 }
 
-// ============================
-// Argmax per sample (batch)
-// class_idx[m] = argmax_n logits[m, n]
-// ============================
 __global__ void argmax_batch(
-    const float* __restrict__ logits,  // [M, N]
+    const float* __restrict__ logits,
     int* __restrict__ class_idx,
     int M, int N)
 {
     int m = blockIdx.x * blockDim.x + threadIdx.x;
     if (m >= M) return;
 
-    const float* row = &logits[m * N];
+    const float* row = &logits[m*N];
     float max_val = row[0];
     int max_i = 0;
-    for (int i = 1; i < N; ++i) {
-        if (row[i] > max_val) {
-            max_val = row[i];
-            max_i = i;
-        }
-    }
+    for (int i = 1; i < N; ++i)
+        if (row[i] > max_val) { max_val = row[i]; max_i = i; }
+
     class_idx[m] = max_i;
 }
 
+bool load_mem_int8(const char* filename, int8_t* dst, int count) {
+    printf("Opening %s ...\n", filename);
+
+    FILE* f = fopen(filename, "r");
+    if (!f) {
+        printf("Could not open file!\n");
+        return false;
+    }
+
+    for (int i = 0; i < count; i++) {
+        unsigned int v;
+        int r = fscanf(f, "%x", &v);
+
+        if (r != 1) {
+            printf("Parse error at index %d (r=%d)\n", i, r);
+            return false;
+        }
+
+        dst[i] = (int8_t)(v & 0xFF);
+    }
+
+    fclose(f);
+    return true;
+}
+
+
+bool load_mem_int32(const char* filename, int32_t* dst, int count) {
+    FILE* f = fopen(filename, "r");
+    if (!f) return false;
+    for (int i = 0; i < count; i++) {
+        unsigned int v;
+        if (fscanf(f, "%x", &v) != 1) return false;
+        dst[i] = (int32_t)v;
+    }
+    fclose(f);
+    return true;
+}
+
+
 // ============================
-// Host test
+// Host
 // ============================
 int main() {
-    // ------------ Host buffers -------------
-    // We’ll support batch, but for now BATCH=1 and reuse X_sample for every row.
     float X_host[BATCH * INPUT_DIM];
     float H_host[BATCH * HIDDEN_DIM];
     float logits_host[BATCH * OUTPUT_DIM];
     int   class_idx_host[BATCH];
 
-    // Copy weights from headers
-    // W1: [64, 8], row-major -> K=64, N=8
-    // W2: [8, 10], row-major -> K=8,  N=10
-    // b1: [8], b2: [10]
-    // (we’ll copy directly to device later; no need for host copies beyond this)
+    for (int b = 0; b < BATCH; ++b)
+        std::memcpy(&X_host[b*INPUT_DIM], X_sample,
+                    INPUT_DIM * sizeof(float));
 
-    // Initialize X_host: for now, replicate X_sample for each batch row
-    for (int b = 0; b < BATCH; ++b) {
-        std::memcpy(&X_host[b * INPUT_DIM], X_sample, INPUT_DIM * sizeof(float));
-    }
-
-    // ------------ Device buffers -------------
+    // Device malloc
     float *d_X, *d_W1, *d_W2, *d_H, *d_logits;
     float *d_b1, *d_b2;
-    int   *d_class_idx;
+    int *d_class_idx;
 
-    cudaMalloc(&d_X,      BATCH * INPUT_DIM   * sizeof(float));
-    cudaMalloc(&d_W1,     INPUT_DIM * HIDDEN_DIM * sizeof(float)); // 64x8
-    cudaMalloc(&d_W2,     HIDDEN_DIM * OUTPUT_DIM * sizeof(float)); // 8x10
-    cudaMalloc(&d_H,      BATCH * HIDDEN_DIM  * sizeof(float));
-    cudaMalloc(&d_logits, BATCH * OUTPUT_DIM  * sizeof(float));
-    cudaMalloc(&d_b1,     HIDDEN_DIM * sizeof(float));
-    cudaMalloc(&d_b2,     OUTPUT_DIM * sizeof(float));
-    cudaMalloc(&d_class_idx, BATCH * sizeof(int));
+    cudaMalloc(&d_X, INPUT_DIM*sizeof(float));
+    cudaMalloc(&d_W1, INPUT_DIM*HIDDEN_DIM*sizeof(float));
+    cudaMalloc(&d_W2, HIDDEN_DIM*OUTPUT_DIM*sizeof(float));
+    cudaMalloc(&d_H, HIDDEN_DIM*sizeof(float));
+    cudaMalloc(&d_logits, OUTPUT_DIM*sizeof(float));
+    cudaMalloc(&d_b1, HIDDEN_DIM*sizeof(float));
+    cudaMalloc(&d_b2, OUTPUT_DIM*sizeof(float));
+    cudaMalloc(&d_class_idx, sizeof(int));
 
-    // Copy host -> device
-    cudaMemcpy(d_X,  X_host, sizeof(X_host), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_W1, W1,     INPUT_DIM * HIDDEN_DIM * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_W2, W2,     HIDDEN_DIM * OUTPUT_DIM * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_b1, b1,     HIDDEN_DIM * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_b2, b2,     OUTPUT_DIM * sizeof(float), cudaMemcpyHostToDevice);
+    // ---------------- Load Quantized MEM Files ----------------
+    int8_t  W1_q[64*8];
+    int32_t b1_q[8];
+    int8_t  W2_q[8*10];
+    int32_t b2_q[10];
 
-    // ------------ Launch configuration -------------
-    dim3 blockG(TILE_N, TILE_M); // 16x16
-    // Hidden GEMM: [BATCH x INPUT_DIM] * [INPUT_DIM x HIDDEN_DIM]
-    int M_h = BATCH;
-    int K_h = INPUT_DIM;
-    int N_h = HIDDEN_DIM;
-    dim3 gridG_hidden((N_h + TILE_N - 1) / TILE_N,
-                      (M_h + TILE_M - 1) / TILE_M);
+    if (!load_mem_int8("./W1_q_orig.mem", W1_q, 64*8)) { printf("Failed W1_q.mem\n"); return -1; }
+    if (!load_mem_int32("./b1_q.mem", b1_q, 8))  { printf("Failed b1_q.mem\n"); return -1; }
+    if (!load_mem_int8("./W2_q.mem", W2_q, 8*10)) { printf("Failed W2_q.mem\n"); return -1; }
+    if (!load_mem_int32("./b2_q.mem", b2_q, 10))  { printf("Failed b2_q.mem\n"); return -1; }
 
-    // Output GEMM: [BATCH x HIDDEN_DIM] * [HIDDEN_DIM x OUTPUT_DIM]
-    int M_o = BATCH;
-    int K_o = HIDDEN_DIM;
-    int N_o = OUTPUT_DIM;
-    dim3 gridG_out((N_o + TILE_N - 1) / TILE_N,
-                   (M_o + TILE_M - 1) / TILE_M);
+    float W1_f[64*8];
+    float b1_f[8];
+    float W2_f[8*10];
+    float b2_f[10];
 
-    // Bias/activation grids
+    for (int i = 0; i < 64*8; i++) W1_f[i] = (float)W1_q[i];
+    for (int i = 0; i < 8; i++)     b1_f[i] = (float)b1_q[i];
+    for (int i = 0; i < 8*10; i++)  W2_f[i] = (float)W2_q[i];
+    for (int i = 0; i < 10; i++)    b2_f[i] = (float)b2_q[i];
+
+
+
+    cudaMemcpy(d_X, X_host, INPUT_DIM*sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_W1, W1_f, 64*8 * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_b1, b1_f, 8 * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_W2, W2_f, 8*10 * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_b2, b2_f, 10 * sizeof(float), cudaMemcpyHostToDevice);
+
+
+    dim3 blockG(TILE_N, TILE_M);
+    dim3 gridG_hidden((HIDDEN_DIM + TILE_N - 1)/TILE_N,
+                      (BATCH + TILE_M - 1)/TILE_M);
+    dim3 gridG_out((OUTPUT_DIM + TILE_N - 1)/TILE_N,
+                   (BATCH + TILE_M - 1)/TILE_M);
+
     dim3 blockA(16, 16);
-    dim3 gridA_hidden((N_h + blockA.x - 1) / blockA.x,
-                      (M_h + blockA.y - 1) / blockA.y);
-    dim3 gridA_out((N_o + blockA.x - 1) / blockA.x,
-                   (M_o + blockA.y - 1) / blockA.y);
+    dim3 gridA_hidden((HIDDEN_DIM + 15)/16, (BATCH + 15)/16);
+    dim3 gridA_out((OUTPUT_DIM + 15)/16, (BATCH + 15)/16);
 
-    // Argmax config
     dim3 blockArg(128);
-    dim3 gridArg((BATCH + blockArg.x - 1) / blockArg.x);
+    dim3 gridArg((BATCH + 127)/128);
 
-    // ------------ Timing setup -------------
+    // Timing
     cudaEvent_t start, stop;
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
 
     cudaEventRecord(start);
 
-    // 1) Hidden layer: GEMM (X @ W1) then bias+ReLU
-    gemm_tiled_kernel<<<gridG_hidden, blockG>>>(d_X, d_W1, d_H, M_h, N_h, K_h);
-    add_bias_relu<<<gridA_hidden, blockA>>>(d_H, d_b1, M_h, N_h);
+    gemm_tiled_kernel<<<gridG_hidden, blockG>>>(d_X, d_W1, d_H, 1, 8, 64);
+    add_bias_relu<<<gridA_hidden, blockA>>>(d_H, d_b1, 1, 8);
 
-    // 2) Output layer: GEMM (H @ W2) then bias
-    gemm_tiled_kernel<<<gridG_out, blockG>>>(d_H, d_W2, d_logits, M_o, N_o, K_o);
-    add_bias<<<gridA_out, blockA>>>(d_logits, d_b2, M_o, N_o);
+    gemm_tiled_kernel<<<gridG_out, blockG>>>(d_H, d_W2, d_logits, 1, 10, 8);
+    add_bias<<<gridA_out, blockA>>>(d_logits, d_b2, 1, 10);
 
-    // 3) Argmax per sample
-    argmax_batch<<<gridArg, blockArg>>>(d_logits, d_class_idx, BATCH, OUTPUT_DIM);
+    argmax_batch<<<gridArg, blockArg>>>(d_logits, d_class_idx, 1, 10);
 
     cudaEventRecord(stop);
     cudaEventSynchronize(stop);
 
-    float ms = 0.0f;
+    float ms = 0;
     cudaEventElapsedTime(&ms, start, stop);
 
-    // Check for kernel errors
-    cudaDeviceSynchronize();
+    cudaMemcpy(H_host,      d_H,      8*sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(logits_host, d_logits, 10*sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(class_idx_host, d_class_idx, sizeof(int), cudaMemcpyDeviceToHost);
+
     printf("Kernel error: %s\n", cudaGetErrorString(cudaGetLastError()));
-    printf("Total inference time (BATCH=%d) = %.6f ms\n", BATCH, ms);
+    printf("Total inference time = %.6f ms\n\n", ms);
 
-    // ------------ Copy back and print one sample -------------
-    cudaMemcpy(H_host,        d_H,      BATCH * HIDDEN_DIM * sizeof(float), cudaMemcpyDeviceToHost);
-    cudaMemcpy(logits_host,   d_logits, BATCH * OUTPUT_DIM * sizeof(float), cudaMemcpyDeviceToHost);
-    cudaMemcpy(class_idx_host,d_class_idx, BATCH * sizeof(int), cudaMemcpyDeviceToHost);
+    // Softmax probabilities
+    float probs[10];
+    float maxLog = logits_host[0];
+    for (int i = 1; i < 10; i++)
+        if (logits_host[i] > maxLog) maxLog = logits_host[i];
 
-    printf("Hidden[0]:\n");
-    for (int i = 0; i < HIDDEN_DIM; i++)
-        printf("%f ", H_host[i]);
-    printf("\n\nLogits[0]:\n");
-    for (int i = 0; i < OUTPUT_DIM; i++)
-        printf("%f ", logits_host[i]);
-    printf("\nPredicted class[0] = %d\n", class_idx_host[0]);
+    float sum = 0.0f;
+    for (int i = 0; i < 10; i++) {
+        probs[i] = expf(logits_host[i] - maxLog);
+        sum += probs[i];
+    }
+    for (int i = 0; i < 10; i++)
+        probs[i] /= sum;
 
-    // ------------ Cleanup -------------
+    printf("Probabilities:\n");
+    for (int i = 0; i < 10; i++)
+        printf("%.6f ", probs[i]);
+    printf("\n\n");
+
+    // Accuracy for 1 input
+    int predicted = class_idx_host[0];
+    printf("Predicted class = %d\n", predicted);
+    printf("Python reference label = %d\n", PYTHON_LABEL);
+
+    if (predicted == PYTHON_LABEL)
+        printf("Accuracy (1 sample) = 100%%\n");
+    else
+        printf("Accuracy (1 sample) = 0%%\n");
+
+    // Cleanup
     cudaFree(d_X);
     cudaFree(d_W1);
     cudaFree(d_W2);
@@ -249,9 +275,6 @@ int main() {
     cudaFree(d_b1);
     cudaFree(d_b2);
     cudaFree(d_class_idx);
-
-    cudaEventDestroy(start);
-    cudaEventDestroy(stop);
 
     return 0;
 }

@@ -1,4 +1,5 @@
 // Inputs from python baseline
+#define PYTHON_LABEL 5
 
 const float X_sample[64] = {
   0.0f, -0.3350165f, 0.5880325f, 0.03864775f, 0.5020583f, 1.097673f, 0.4925725f, -0.1250229f,
